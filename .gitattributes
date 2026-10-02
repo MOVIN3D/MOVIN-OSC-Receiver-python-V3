@@ -1,0 +1,6 @@
+# Preserve packaged text bytes across Windows and Linux checkouts.
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+VERSION text eol=lf
