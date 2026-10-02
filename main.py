@@ -1,7 +1,9 @@
 import argparse
+import logging
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -12,8 +14,10 @@ from OpenGL.GL import (
     GL_BLEND,
     GL_COLOR_ARRAY,
     GL_COLOR_BUFFER_BIT,
+    GL_CURRENT_BIT,
     GL_DEPTH_BUFFER_BIT,
     GL_DEPTH_TEST,
+    GL_ENABLE_BIT,
     GL_FLOAT,
     GL_LINE_SMOOTH,
     GL_LINES,
@@ -22,28 +26,36 @@ from OpenGL.GL import (
     GL_POINT_SMOOTH,
     GL_POINTS,
     GL_PROJECTION,
+    GL_RGBA,
     GL_SRC_ALPHA,
+    GL_UNSIGNED_BYTE,
     GL_VERTEX_ARRAY,
     glBlendFunc,
     glClear,
     glClearColor,
     glColor3f,
     glColorPointer,
+    glDisable,
     glDisableClientState,
     glDrawArrays,
+    glDrawPixels,
     glEnable,
     glEnableClientState,
     glLineWidth,
     glLoadIdentity,
     glMatrixMode,
     glPointSize,
+    glPopAttrib,
+    glPushAttrib,
     glVertexPointer,
+    glWindowPos2d,
 )
 from OpenGL.GLU import gluLookAt, gluPerspective
 from pygame.locals import DOUBLEBUF, K_DOWN, K_ESCAPE, K_r, K_UP, KEYDOWN, MOUSEBUTTONDOWN
 from pygame.locals import MOUSEBUTTONUP, MOUSEMOTION, OPENGL, QUIT
 from pythonosc.dispatcher import Dispatcher
-from pythonosc.osc_server import ThreadingOSCUDPServer
+from pythonosc.osc_message_builder import OscMessageBuilder
+from pythonosc.osc_server import BlockingOSCUDPServer
 
 
 _orig_get_string = _osc_types.get_string
@@ -75,6 +87,14 @@ _osc_types.get_string = _get_string_safe
 
 BONE_FIELD_COUNT = 17
 POINT_FIELD_COUNT = 3
+MAX_BONES = 4096
+MAX_POINTS = 100_000
+MAX_CHUNKS = 4096
+MAX_ACTORS = 8
+MAX_PENDING_FRAMES = 3
+ASSEMBLY_TIMEOUT = 0.5
+RESTART_WAIT = 1.0
+logger = logging.getLogger("movin.osc")
 ACTOR_COLORS = [
     (0.8, 0.8, 0.8),
     (1.0, 0.5, 0.3),
@@ -109,21 +129,22 @@ class SkeletonFrameAssembly:
     frame_idx: int
     num_chunks: int
     total_bone_count: int
+    created_at: float
     chunks: Dict[int, List[BoneRecord]] = field(default_factory=dict)
+    received: int = 0
 
     def add_chunk(self, chunk_index: int, bones: List[BoneRecord]) -> None:
         self.chunks[chunk_index] = bones
+        self.received += len(bones)
 
     def is_complete(self) -> bool:
         return len(self.chunks) == self.num_chunks
 
     def to_bones(self) -> List[BoneRecord]:
-        ordered: List[Optional[BoneRecord]] = [None] * self.total_bone_count
-        for chunk_idx in sorted(self.chunks):
-            for bone in self.chunks[chunk_idx]:
-                if 0 <= bone.bone_index < self.total_bone_count:
-                    ordered[bone.bone_index] = bone
-        return [bone for bone in ordered if bone is not None]
+        bones = [bone for chunk in self.chunks.values() for bone in chunk]
+        if len(bones) != self.total_bone_count:
+            raise ValueError("Motion frame bone count does not match its header")
+        return bones
 
 
 @dataclass
@@ -131,36 +152,131 @@ class PointCloudAssembly:
     frame_idx: int
     total_points: int
     num_chunks: int
+    created_at: float
     chunks: Dict[int, np.ndarray] = field(default_factory=dict)
+    received: int = 0
 
     def add_chunk(self, chunk_idx: int, points: np.ndarray) -> None:
         self.chunks[chunk_idx] = points
+        self.received += len(points)
 
     def is_complete(self) -> bool:
         return len(self.chunks) == self.num_chunks
 
     def to_points(self) -> np.ndarray:
-        if not self.chunks:
-            return np.empty((0, 3), dtype=np.float32)
-        ordered = [self.chunks[idx] for idx in sorted(self.chunks)]
-        return np.vstack(ordered).astype(np.float32, copy=False)
+        points = np.concatenate([self.chunks[idx] for idx in range(self.num_chunks)])
+        if len(points) != self.total_points:
+            raise ValueError("Point cloud count does not match its header")
+        points.setflags(write=False)
+        return points
+
+
+@dataclass
+class FrameStream:
+    latest: int = -1
+    progressed_at: float = 0.0
+    heard_at: float = 0.0
+    frames: Dict[int, SkeletonFrameAssembly | PointCloudAssembly] = field(default_factory=dict)
+
+    def accept(self, frame: int, now: float) -> bool:
+        self.frames = {f: a for f, a in self.frames.items() if now - a.created_at < ASSEMBLY_TIMEOUT}
+        # Older/duplicate packets never refresh the restart timer.
+        if frame < self.latest and now - self.progressed_at >= RESTART_WAIT:
+            self.frames.clear()
+            self.latest = -1
+        accepted = frame > self.latest
+        if accepted:
+            self.heard_at = now
+            if frame not in self.frames and len(self.frames) >= MAX_PENDING_FRAMES:
+                oldest = min(self.frames)
+                if frame > oldest:
+                    del self.frames[oldest]
+                else:
+                    accepted = False
+        return accepted
+
+    def publish(self, frame: int, now: float) -> None:
+        self.latest = frame
+        self.progressed_at = now
+        self.frames = {f: a for f, a in self.frames.items() if f > frame}
+
+
+class FrameRate:
+    def __init__(self) -> None:
+        self.times = deque(maxlen=4096)
+
+    def add(self, now: float) -> None:
+        if self.times and now - self.times[-1] >= 1:
+            self.times.clear()
+        self.times.append(now)
+
+    def read(self, now: float) -> Tuple[float, float]:
+        while len(self.times) > 1 and self.times[0] < now - 1:
+            self.times.popleft()
+        elapsed = now - self.times[0] if self.times else 0
+        fps = (len(self.times) - 1) / elapsed if len(self.times) > 1 and elapsed > 0 else 0.0
+        age = now - self.times[-1] if self.times else -1.0
+        return fps, age
 
 
 class SharedState:
     def __init__(self, timeout: float) -> None:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Timeout must be a positive finite number")
         self.lock = threading.Lock()
         self.timeout = timeout
-        self.motion_assemblies: Dict[Tuple[str, int], SkeletonFrameAssembly] = {}
-        self.point_assemblies: Dict[int, PointCloudAssembly] = {}
+        self.source: Optional[Tuple[str, int]] = None
+        self.source_heard_at = 0.0
+        self.motion_streams: Dict[str, FrameStream] = {}
+        self.point_stream = FrameStream()
         self.latest_skeletons: Dict[str, List[BoneRecord]] = {}
         self.latest_points: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.last_update: Dict[str, float] = {}
         self.last_points_at = 0.0
-        self.latest_motion_frame_idx: Dict[str, int] = {}
-        self.latest_point_frame_idx = -1
+        self.last_error_at = float("-inf")
+        self.motion_rates: Dict[str, FrameRate] = {}
+        self.cloud_rate = FrameRate()
+        self.viewer_rate = FrameRate()
+
+    def accept_source(self, source: Tuple[str, int], now: float) -> bool:
+        accepted = source == self.source or self.source is None or now - self.source_heard_at >= RESTART_WAIT
+        if accepted:
+            if source != self.source:
+                self.source = source
+                self.motion_streams.clear()
+                self.point_stream = FrameStream()
+                with self.lock:
+                    self.latest_skeletons.clear()
+                    self.last_update.clear()
+                    self.latest_points = np.empty((0, 3), dtype=np.float32)
+                    self.last_points_at = 0.0
+                    self.motion_rates.clear()
+                    self.cloud_rate = FrameRate()
+            self.source_heard_at = now
+        return accepted
+
+    def report_invalid(self, error: Exception) -> None:
+        now = time.monotonic()
+        if now - self.last_error_at >= 1:
+            logger.warning("Discarded invalid OSC packet: %s", error)
+            self.last_error_at = now
+
+    def expire(self, now: float) -> None:
+        self.motion_streams = {name: stream for name, stream in self.motion_streams.items()
+                               if now - stream.heard_at < max(self.timeout, RESTART_WAIT)}
+        for stream in [*self.motion_streams.values(), self.point_stream]:
+            stream.frames = {f: a for f, a in stream.frames.items() if now - a.created_at < ASSEMBLY_TIMEOUT}
+        with self.lock:
+            for name in [name for name, at in self.last_update.items() if now - at >= self.timeout]:
+                self.latest_skeletons.pop(name, None)
+                del self.last_update[name]
+                self.motion_rates.pop(name, None)
+            if self.latest_points.size and now - self.last_points_at >= self.timeout:
+                self.latest_points = np.empty((0, 3), dtype=np.float32)
 
     def add_motion_chunk(
         self,
+        source: Tuple[str, int],
         timestamp: str,
         actor_name: str,
         frame_idx: int,
@@ -169,21 +285,17 @@ class SharedState:
         total_bone_count: int,
         bones: List[BoneRecord],
     ) -> None:
-        with self.lock:
-            previous_frame = self.latest_motion_frame_idx.get(actor_name, -1)
-            if frame_idx < previous_frame - 1:
-                if previous_frame - frame_idx > 100:
-                    self.latest_motion_frame_idx[actor_name] = -1
-                    self.motion_assemblies = {
-                        key: value
-                        for key, value in self.motion_assemblies.items()
-                        if key[0] != actor_name
-                    }
-                else:
-                    return
-
-            key = (actor_name, frame_idx)
-            assembly = self.motion_assemblies.get(key)
+        now = time.monotonic()
+        if self.accept_source(source, now):
+            self.expire(now)
+            if actor_name not in self.motion_streams:
+                if len(self.motion_streams) >= MAX_ACTORS:
+                    raise ValueError("Too many active actors")
+                self.motion_streams[actor_name] = FrameStream()
+            stream = self.motion_streams[actor_name]
+            if not stream.accept(frame_idx, now):
+                return
+            assembly = stream.frames.get(frame_idx)
             if assembly is None:
                 assembly = SkeletonFrameAssembly(
                     timestamp=timestamp,
@@ -191,81 +303,89 @@ class SharedState:
                     frame_idx=frame_idx,
                     num_chunks=num_chunks,
                     total_bone_count=total_bone_count,
+                    created_at=now,
                 )
-                self.motion_assemblies[key] = assembly
-
-            assembly.add_chunk(chunk_index, bones)
-            if not assembly.is_complete():
-                return
-
-            skeleton = compute_world_pose(assembly.to_bones())
-            self.latest_skeletons[actor_name] = skeleton
-            self.last_update[actor_name] = time.time()
-            self.latest_motion_frame_idx[actor_name] = frame_idx
-            self.motion_assemblies = {
-                motion_key: motion_value
-                for motion_key, motion_value in self.motion_assemblies.items()
-                if motion_key[0] != actor_name or motion_key[1] >= frame_idx - 1
-            }
+                stream.frames[frame_idx] = assembly
+            try:
+                if (assembly.timestamp, assembly.num_chunks, assembly.total_bone_count) != (timestamp, num_chunks, total_bone_count):
+                    raise ValueError("Motion chunks disagree about their frame header")
+                if chunk_index not in assembly.chunks:
+                    if assembly.received + len(bones) > total_bone_count:
+                        raise ValueError("Motion chunks exceed the declared bone count")
+                    assembly.add_chunk(chunk_index, bones)
+                    if assembly.is_complete():
+                        skeleton = compute_world_pose(assembly.to_bones())
+                        stream.publish(frame_idx, now)
+                        with self.lock:
+                            self.latest_skeletons[actor_name] = skeleton
+                            self.last_update[actor_name] = now
+                            if actor_name not in self.motion_rates:
+                                self.motion_rates[actor_name] = FrameRate()
+                            self.motion_rates[actor_name].add(now)
+            except ValueError:
+                stream.frames.pop(frame_idx, None)
+                raise
 
     def add_point_chunk(
         self,
+        source: Tuple[str, int],
         frame_idx: int,
         total_points: int,
         chunk_idx: int,
         num_chunks: int,
         points: np.ndarray,
     ) -> None:
-        with self.lock:
-            if frame_idx < self.latest_point_frame_idx:
-                if self.latest_point_frame_idx - frame_idx > 100:
-                    self.latest_point_frame_idx = -1
-                    self.point_assemblies.clear()
-                else:
-                    return
-
-            if frame_idx != self.latest_point_frame_idx:
-                self.latest_point_frame_idx = frame_idx
-                self.point_assemblies.clear()
-
-            assembly = self.point_assemblies.get(frame_idx)
+        now = time.monotonic()
+        if self.accept_source(source, now) and self.point_stream.accept(frame_idx, now):
+            stream = self.point_stream
+            assembly = stream.frames.get(frame_idx)
             if assembly is None:
                 assembly = PointCloudAssembly(
                     frame_idx=frame_idx,
                     total_points=total_points,
                     num_chunks=num_chunks,
+                    created_at=now,
                 )
-                self.point_assemblies[frame_idx] = assembly
-
-            assembly.add_chunk(chunk_idx, points)
-            if assembly.is_complete():
-                self.latest_points = assembly.to_points()
-                self.last_points_at = time.time()
+                stream.frames[frame_idx] = assembly
+            try:
+                if (assembly.num_chunks, assembly.total_points) != (num_chunks, total_points):
+                    raise ValueError("Point cloud chunks disagree about their frame header")
+                if chunk_idx not in assembly.chunks:
+                    if assembly.received + len(points) > total_points:
+                        raise ValueError("Point cloud chunks exceed the declared point count")
+                    assembly.add_chunk(chunk_idx, points)
+                    if assembly.is_complete():
+                        cloud = assembly.to_points()
+                        stream.publish(frame_idx, now)
+                        with self.lock:
+                            self.latest_points = cloud
+                            self.last_points_at = now
+                            self.cloud_rate.add(now)
+            except ValueError:
+                stream.frames.pop(frame_idx, None)
+                raise
 
     def snapshot(self) -> Tuple[Dict[str, List[BoneRecord]], np.ndarray]:
-        now = time.time()
+        now = time.monotonic()
         with self.lock:
             stale_actors = [actor for actor, updated_at in self.last_update.items() if now - updated_at > self.timeout]
             for actor in stale_actors:
                 self.latest_skeletons.pop(actor, None)
                 self.last_update.pop(actor, None)
-                self.motion_assemblies = {
-                    key: value for key, value in self.motion_assemblies.items() if key[0] != actor
-                }
-
-            skeletons = {
-                actor: [clone_bone(bone) for bone in bones]
-                for actor, bones in self.latest_skeletons.items()
-            }
-            points = self.latest_points.copy()
+                self.motion_rates.pop(actor, None)
+            if self.latest_points.size and now - self.last_points_at >= self.timeout:
+                self.latest_points = np.empty((0, 3), dtype=np.float32)
+            # Published frames are not mutated; rendering only needs their references.
+            skeletons = self.latest_skeletons.copy()
+            points = self.latest_points
             return skeletons, points
 
 
 def normalize_quaternion(quat: np.ndarray) -> np.ndarray:
-    norm = np.linalg.norm(quat)
+    norm = np.linalg.norm(quat.astype(np.float64))
     if norm <= 1e-8:
         return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-    return quat / norm
+    return (quat / norm).astype(np.float32)
 
 
 def quaternion_multiply(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -312,87 +432,107 @@ def trs_matrix(position: np.ndarray, rotation: np.ndarray, scale: np.ndarray) ->
     return matrix
 
 
-def clone_bone(bone: BoneRecord) -> BoneRecord:
-    return BoneRecord(
-        bone_index=bone.bone_index,
-        parent_index=bone.parent_index,
-        bone_name=bone.bone_name,
-        local_position=bone.local_position.copy(),
-        rest_rotation=bone.rest_rotation.copy(),
-        local_rotation=bone.local_rotation.copy(),
-        local_scale=bone.local_scale.copy(),
-        world_position=bone.world_position.copy(),
-        world_rotation=bone.world_rotation.copy(),
-    )
-
-
 def compute_world_pose(bones: List[BoneRecord]) -> List[BoneRecord]:
     ordered = sorted(bones, key=lambda bone: bone.bone_index)
     bone_map = {bone.bone_index: bone for bone in ordered}
-
+    if len(bone_map) != len(bones) or len({bone.bone_name for bone in bones}) != len(bones):
+        raise ValueError("Motion frame contains duplicate bone indices or names")
+    children = {bone.bone_index: [] for bone in ordered}
+    pending = deque()
+    for bone in ordered:
+        if bone.parent_index == -1:
+            pending.append(bone.bone_index)
+        elif bone.parent_index not in bone_map:
+            raise ValueError("Motion frame is missing a parent bone")
+        else:
+            children[bone.parent_index].append(bone.bone_index)
     unity_matrices: Dict[int, np.ndarray] = {}
     unity_rotations: Dict[int, np.ndarray] = {}
-    def resolve_pose(bone_index: int) -> Tuple[np.ndarray, np.ndarray]:
-        if bone_index in unity_matrices:
-            return unity_matrices[bone_index], unity_rotations[bone_index]
-
+    while pending:
+        bone_index = pending.popleft()
         bone = bone_map[bone_index]
         local_rotation = normalize_quaternion(bone.local_rotation)
-        local_scale = bone.local_scale.astype(np.float32)
-        local_matrix = trs_matrix(bone.local_position, local_rotation, local_scale)
-        if bone.parent_index < 0 or bone.parent_index not in bone_map:
+        local_matrix = trs_matrix(bone.local_position, local_rotation, bone.local_scale)
+        if bone.parent_index == -1:
             unity_matrices[bone_index] = local_matrix
             unity_rotations[bone_index] = local_rotation
         else:
-            parent_matrix, parent_rotation = resolve_pose(bone.parent_index)
-            unity_matrices[bone_index] = parent_matrix @ local_matrix
+            with np.errstate(over="ignore", invalid="ignore"):
+                unity_matrices[bone_index] = unity_matrices[bone.parent_index] @ local_matrix
             unity_rotations[bone_index] = normalize_quaternion(
-                quaternion_multiply(parent_rotation, local_rotation)
+                quaternion_multiply(unity_rotations[bone.parent_index], local_rotation)
             )
-
+        if not np.isfinite(unity_matrices[bone_index]).all():
+            raise ValueError("Motion hierarchy produces a non-finite world transform")
         bone.world_position = unity_to_opengl_pos(unity_matrices[bone_index][:3, 3])
         bone.world_rotation = unity_to_opengl_rot(unity_rotations[bone_index])
-        return unity_matrices[bone_index], unity_rotations[bone_index]
-
-    for bone in ordered:
-        resolve_pose(bone.bone_index)
-
+        pending.extend(children[bone_index])
+    if len(unity_matrices) != len(bones):
+        raise ValueError("Motion hierarchy contains a cycle")
     return ordered
 
 
-def parse_motion(address: str, *osc_args: object, state: SharedState) -> None:
+def osc_int(value: object, minimum: int, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"Expected an OSC integer between {minimum} and {maximum}")
+    return value
+
+
+def osc_name(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 256 or '\0' in value:
+        raise ValueError("Expected a non-empty name of at most 256 characters")
+    return value
+
+
+def parse_motion(address: str, *osc_args: object, state: SharedState, source: Tuple[str, int]) -> None:
     del address
     if len(osc_args) < 7:
-        return
+        raise ValueError("Incomplete motion header")
 
-    timestamp = str(osc_args[0])
-    actor_name = str(osc_args[1])
-    frame_idx = int(osc_args[2])
-    num_chunks = int(osc_args[3])
-    chunk_index = int(osc_args[4])
-    total_bone_count = int(osc_args[5])
-    chunk_bone_count = int(osc_args[6])
+    timestamp = osc_name(osc_args[0])
+    actor_name = osc_name(osc_args[1])
+    frame_idx = osc_int(osc_args[2], 0, 2**31 - 1)
+    total_bone_count = osc_int(osc_args[5], 1, MAX_BONES)
+    num_chunks = osc_int(osc_args[3], 1, min(total_bone_count, MAX_CHUNKS))
+    chunk_index = osc_int(osc_args[4], 0, num_chunks - 1)
+    chunk_bone_count = osc_int(osc_args[6], 1, total_bone_count)
     payload = osc_args[7:]
     expected_len = chunk_bone_count * BONE_FIELD_COUNT
-    if len(payload) < expected_len:
-        return
+    if len(payload) != expected_len:
+        raise ValueError("Motion payload length does not match its header")
 
     bones: List[BoneRecord] = []
     for i in range(chunk_bone_count):
         base = i * BONE_FIELD_COUNT
+        values = payload[base + 3 : base + BONE_FIELD_COUNT]
+        if not all(type(v) is float for v in values):
+            raise ValueError("Bone transforms must contain OSC floats")
+        with np.errstate(over="ignore"):
+            values = np.asarray(values, dtype=np.float32)
+        if not np.isfinite(values).all():
+            raise ValueError("Bone transforms must be finite")
+        for rotation in (values[3:7], values[7:11]):
+            norm = np.linalg.norm(rotation.astype(np.float64))
+            if not math.isfinite(norm) or norm < 1e-6:
+                raise ValueError("Bone rotations must be non-zero finite quaternions")
+        index = osc_int(payload[base], 0, MAX_BONES - 1)
+        parent = osc_int(payload[base + 1], -1, MAX_BONES - 1)
+        if index == parent:
+            raise ValueError("A bone cannot be its own parent")
         bones.append(
             BoneRecord(
-                bone_index=int(payload[base + 0]),
-                parent_index=int(payload[base + 1]),
-                bone_name=str(payload[base + 2]),
-                local_position=np.array(payload[base + 3 : base + 6], dtype=np.float32),
-                rest_rotation=np.array(payload[base + 6 : base + 10], dtype=np.float32),
-                local_rotation=np.array(payload[base + 10 : base + 14], dtype=np.float32),
-                local_scale=np.array(payload[base + 14 : base + 17], dtype=np.float32),
+                bone_index=index,
+                parent_index=parent,
+                bone_name=osc_name(payload[base + 2]),
+                local_position=values[:3],
+                rest_rotation=values[3:7],
+                local_rotation=values[7:11],
+                local_scale=values[11:14],
             )
         )
 
     state.add_motion_chunk(
+        source=source,
         timestamp=timestamp,
         actor_name=actor_name,
         frame_idx=frame_idx,
@@ -403,24 +543,30 @@ def parse_motion(address: str, *osc_args: object, state: SharedState) -> None:
     )
 
 
-def parse_point_cloud(address: str, *osc_args: object, state: SharedState) -> None:
+def parse_point_cloud(address: str, *osc_args: object, state: SharedState, source: Tuple[str, int]) -> None:
     del address
     if len(osc_args) < 5:
-        return
+        raise ValueError("Incomplete point cloud header")
 
-    frame_idx = int(osc_args[0])
-    total_points = int(osc_args[1])
-    chunk_idx = int(osc_args[2])
-    num_chunks = int(osc_args[3])
-    chunk_point_count = int(osc_args[4])
+    frame_idx = osc_int(osc_args[0], 0, 2**31 - 1)
+    total_points = osc_int(osc_args[1], 0, MAX_POINTS)
+    num_chunks = osc_int(osc_args[3], 1, min(max(1, total_points), MAX_CHUNKS))
+    chunk_idx = osc_int(osc_args[2], 0, num_chunks - 1)
+    chunk_point_count = osc_int(osc_args[4], 1 if total_points else 0, total_points)
     payload = osc_args[5:]
     expected_len = chunk_point_count * POINT_FIELD_COUNT
-    if len(payload) < expected_len:
-        return
+    if len(payload) != expected_len:
+        raise ValueError("Point cloud payload length does not match its header")
+    if not all(type(v) is float for v in payload):
+        raise ValueError("Point cloud coordinates must contain OSC floats")
 
-    points = np.asarray(payload[:expected_len], dtype=np.float32).reshape((-1, 3))
+    with np.errstate(over="ignore"):
+        points = np.asarray(payload, dtype=np.float32).reshape((-1, 3))
+    if not np.isfinite(points).all():
+        raise ValueError("Point cloud coordinates must be finite")
     points[:, 0] *= -1.0
     state.add_point_chunk(
+        source=source,
         frame_idx=frame_idx,
         total_points=total_points,
         chunk_idx=chunk_idx,
@@ -431,9 +577,54 @@ def parse_point_cloud(address: str, *osc_args: object, state: SharedState) -> No
 
 def create_dispatcher(state: SharedState) -> Dispatcher:
     dispatcher = Dispatcher()
-    dispatcher.map("/MOVIN/Frame", lambda addr, *args: parse_motion(addr, *args, state=state))
-    dispatcher.map("/MOVIN/PointCloud", lambda addr, *args: parse_point_cloud(addr, *args, state=state))
+    def receive(source, address, *args):
+        try:
+            if address == "/MOVIN/Frame":
+                parse_motion(address, *args, state=state, source=source)
+            else:
+                parse_point_cloud(address, *args, state=state, source=source)
+        except (ValueError, TypeError, OverflowError) as error:
+            state.report_invalid(error)
+    dispatcher.map("/MOVIN/Frame", receive, needs_reply_address=True)
+    dispatcher.map("/MOVIN/PointCloud", receive, needs_reply_address=True)
     return dispatcher
+
+
+class ReceiverServer(BlockingOSCUDPServer):
+    max_packet_size = 65535
+
+    def __init__(self, address: Tuple[str, int], state: SharedState) -> None:
+        self.state = state
+        super().__init__(address, create_dispatcher(state))
+        self.dispatcher.map("/MOVIN/OSC/Status/Request", self.reply_status, needs_reply_address=True)
+
+    def reply_status(self, source, address, *args) -> None:
+        try:
+            if len(args) != 3:
+                raise ValueError("Invalid OSC status request argument count")
+            token, port, actor = args
+            if (not isinstance(token, str) or len(token) != 32
+                    or any(c not in '0123456789abcdefABCDEF' for c in token)
+                    or type(port) is not int or not 1 <= port <= 65535
+                    or not isinstance(actor, str) or len(actor) > 256 or '\0' in actor):
+                raise ValueError("Invalid OSC status request")
+            with self.state.lock:
+                now = time.monotonic()
+                same_source = source == self.state.source
+                rate = self.state.motion_rates.get(actor) if same_source else None
+                motion, motion_age = rate.read(now) if rate else (0.0, -1.0)
+                cloud, cloud_age = self.state.cloud_rate.read(now) if same_source else (0.0, -1.0)
+                viewer, viewer_age = self.state.viewer_rate.read(now)
+            message = OscMessageBuilder(address="/MOVIN/OSC/Status")
+            values = (token, 1, actor, motion, cloud, viewer, motion_age, cloud_age, viewer_age, int(same_source))
+            for value, kind in zip(values, "sisffffffi"):
+                message.add_arg(value, kind)
+            self.socket.sendto(message.build().dgram, (source[0], port))
+        except (ValueError, TypeError, OverflowError, OSError) as error:
+            self.state.report_invalid(error)
+
+    def service_actions(self) -> None:
+        self.state.expire(time.monotonic())
 
 
 class ViewerApp:
@@ -451,6 +642,10 @@ class ViewerApp:
         self.last_mouse = (0, 0)
         self.clock: Optional[pygame.time.Clock] = None
         self._grid_verts: Optional[np.ndarray] = None
+        self.info_at = float("-inf")
+        self.info_lines = ()
+        self.info_pixels = b""
+        self.info_size = (0, 0)
 
     def _build_grid(self) -> None:
         verts = []
@@ -474,6 +669,7 @@ class ViewerApp:
         glEnableClientState(GL_VERTEX_ARRAY)
         self._build_grid()
         self.clock = pygame.time.Clock()
+        self.info_font = pygame.font.SysFont("malgungothic,notosans,sans", 18)
         print("Controls: Drag=rotate, Scroll=zoom, R=reset, Arrows=move, ESC=exit")
 
     def draw_grid(self) -> None:
@@ -594,6 +790,50 @@ class ViewerApp:
         )
         gluLookAt(*camera_pos, *self.cam_target, 0, 1, 0)
 
+    def draw_info(self, skeletons: Dict[str, List[BoneRecord]], point_count: int) -> None:
+        now = time.monotonic()
+        if now - self.info_at >= 0.1:
+            self.info_at = now
+            with self.state.lock:
+                now = time.monotonic()
+                rates = {name: rate.read(now)[0] for name, rate in self.state.motion_rates.items()}
+                cloud_fps = self.state.cloud_rate.read(now)[0]
+                viewer_fps = self.state.viewer_rate.read(now)[0]
+            lines = [("OSC Stream", (240, 243, 247))]
+            if skeletons:
+                for index, (name, bones) in enumerate(sorted(skeletons.items())):
+                    motion_fps = rates.get(name, 0.0)
+                    name = name.replace('\r', ' ').replace('\n', ' ')
+                    suffix = f" | {len(bones):,} bones"
+                    if self.info_font.size(name + suffix)[0] > 470:
+                        while name and self.info_font.size(name + "..." + suffix)[0] > 470:
+                            name = name[:-1]
+                        name += "..."
+                    color = tuple(round(c * 255) for c in ACTOR_COLORS[index % len(ACTOR_COLORS)])
+                    lines.append((name + suffix, color))
+                    lines.append((f"Received Motion: {motion_fps:.1f} fps", (200, 205, 215)))
+            else:
+                lines.append(("Waiting for motion...", (255, 190, 80)))
+            lines.append((f"Point cloud: {point_count:,} points", (100, 210, 245)))
+            lines.append((f"Received Pointcloud: {cloud_fps:.1f} fps", (100, 210, 245)))
+            lines.append((f"Viewer: {viewer_fps:.1f} fps", (240, 243, 247)))
+            # Rebuild text only when it changes, at most ten times per second.
+            if tuple(lines) != self.info_lines:
+                self.info_lines = tuple(lines)
+                labels = [self.info_font.render(text, True, color) for text, color in lines]
+                row_height = self.info_font.get_linesize() + 5
+                self.info_size = (max(label.get_width() for label in labels) + 28, len(labels) * row_height + 18)
+                panel = pygame.Surface(self.info_size, pygame.SRCALPHA)
+                panel.fill((14, 17, 23, 225))
+                for row, label in enumerate(labels):
+                    panel.blit(label, (14, 9 + row * row_height))
+                self.info_pixels = pygame.image.tobytes(panel, "RGBA", True)
+        glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT)
+        glDisable(GL_DEPTH_TEST)
+        glWindowPos2d(16, pygame.display.get_window_size()[1] - 16 - self.info_size[1])
+        glDrawPixels(*self.info_size, GL_RGBA, GL_UNSIGNED_BYTE, self.info_pixels)
+        glPopAttrib()
+
     def handle_events(self) -> bool:
         for event in pygame.event.get():
             if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
@@ -637,7 +877,10 @@ class ViewerApp:
             self.draw_skeleton(joints, color_idx=idx)
 
         self.draw_point_cloud(points)
+        self.draw_info(skeletons, len(points))
         pygame.display.flip()
+        with self.state.lock:
+            self.state.viewer_rate.add(time.monotonic())
         if self.clock is not None:
             self.clock.tick(max(1, int(round(1.0 / self.tick_interval))))
 
@@ -666,11 +909,10 @@ def main() -> None:
     args = parser.parse_args()
 
     state = SharedState(timeout=args.timeout)
-    dispatcher = create_dispatcher(state)
-    server = ThreadingOSCUDPServer((args.host, args.port), dispatcher)
+    server = ReceiverServer((args.host, args.port), state)
 
     print(f"Listening for OSC on {args.host}:{args.port}")
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     server_thread.start()
 
     try:
@@ -683,6 +925,7 @@ def main() -> None:
     finally:
         server.shutdown()
         server.server_close()
+        server_thread.join()
 
 
 if __name__ == "__main__":
